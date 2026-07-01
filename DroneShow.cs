@@ -11,7 +11,7 @@ using UnityEngine;
 
 namespace Oxide.Plugins
 {
-    [Info("DroneShow", "jerky+claude", "1.0.0")]
+    [Info("DroneShow", "jerky+claude", "1.1.0")]
     [Description("Control drone fleets for formation flight, lights, text/pattern shows, and a wave-based minigame.")]
     public class DroneShow : RustPlugin
     {
@@ -710,12 +710,15 @@ namespace Oxide.Plugins
                 ["Usage_PatternDelete"] = "Usage: /dronepattern delete <name>",
                 ["Pattern_Deleted"] = "Deleted '{0}'.",
                 ["Pattern_DeleteNotFound"] = "Not found.",
+                ["Pattern_Reloaded"] = "Reloaded {0} pattern(s) from data/DroneShow_Patterns.json.",
+                ["Pattern_ReloadError"] = "Could not parse data/DroneShow_Patterns.json (see server console). Kept the current patterns.",
                 ["Help_Pattern"] =
                     "<color=#7FdBFF>Pattern editor</color>\n" +
                     "/dronepattern new <name> <width> <height> - create new (UI editor)\n" +
                     "/dronepattern edit <name> - edit an existing one\n" +
                     "/dronepattern link <group> - live-preview edits on real drones\n" +
                     "/dronepattern list / delete <name>\n" +
+                    "/dronepattern reload - reload patterns from the data file (after manual edits)\n" +
                     "After saving: /drone pattern <group> <name> to display",
                 ["Pattern_Saved"] = "Saved pattern '{0}'. Display it with /drone pattern <group> {0}.",
                 ["Ui_EditTitle"] = "Pattern edit: {0}  {1}x{2}   Pick a mode/brush and click cells (rectangle = click 2 points)",
@@ -841,12 +844,15 @@ namespace Oxide.Plugins
                 ["Usage_PatternDelete"] = "使い方: /dronepattern delete <名前>",
                 ["Pattern_Deleted"] = "'{0}' を削除しました。",
                 ["Pattern_DeleteNotFound"] = "見つかりません。",
+                ["Pattern_Reloaded"] = "data/DroneShow_Patterns.json から {0} 件のパターンを再読込しました。",
+                ["Pattern_ReloadError"] = "data/DroneShow_Patterns.json を解析できませんでした(サーバーコンソール参照)。現在のパターンを維持します。",
                 ["Help_Pattern"] =
                     "<color=#7FdBFF>パターン作成ツール</color>\n" +
                     "/dronepattern new <名前> <幅> <高さ> - 新規作成(UIエディタ)\n" +
                     "/dronepattern edit <名前> - 既存を編集\n" +
                     "/dronepattern link <グループ> - 編集を実機に即プレビュー\n" +
                     "/dronepattern list / delete <名前>\n" +
+                    "/dronepattern reload - データファイルからパターンを再読込(手編集後に)\n" +
                     "保存後: /drone pattern <グループ> <名前> で表示",
                 ["Pattern_Saved"] = "パターン '{0}' を保存しました。/drone pattern <グループ> {0} で表示できます。",
                 ["Ui_EditTitle"] = "パターン編集: {0}  {1}x{2}   モード/筆を選んでセルをクリック（矩形は2点クリック）",
@@ -1565,43 +1571,84 @@ namespace Oxide.Plugins
             drone.Kill();
         }
 
-        // Shared gunner logic: regular bullets (hitscan). Gunshot/muzzle flash + impact effect.
-        // 'pellets' shots with 'spread' degrees of dispersion. Hit chance is derived from the spread.
+        // Shared gunner logic: NPC-style hitscan. Each pellet is fired down a randomized aim cone and
+        // occluded by solid geometry (world/terrain/construction/deployed), so cover blocks the shot and
+        // distance + spread make it dodgeable. A shot only hurts the player if its line actually passes
+        // through the body capsule AND nothing blocks the path.
         public void EnemyShoot(Drone drone, BasePlayer target, float damage, float spreadDeg, int pellets)
         {
             if (drone == null || drone.IsDestroyed || target == null || target.IsDead()) return;
             Vector3 from = drone.transform.position + Vector3.down * 0.3f;
-            Vector3 aim = target.eyes != null ? target.eyes.position : target.transform.position + Vector3.up * 1.2f;
-            float dist = Vector3.Distance(from, aim);
+            // sample points on the player's body for line-of-sight and hit tests
+            Vector3 basePos = target.transform.position;
+            Vector3 eyes = target.eyes != null ? target.eyes.position : basePos + Vector3.up * 1.5f;
+            Vector3 chest = basePos + Vector3.up * 0.9f;
+            Vector3 hips = basePos + Vector3.up * 0.3f;
+            float dist = Vector3.Distance(from, chest);
             if (dist > config.GunRange) return; // out of range
+
+            int coverMask = Rust.Layers.Mask.World | Rust.Layers.Mask.Terrain
+                          | Rust.Layers.Mask.Construction | Rust.Layers.Mask.Deployed;
+
+            // Fire gate: like an NPC, don't shoot at all unless at least one body point is visible.
+            // Standing under a solid (or holey) roof or inside a container blocks all three -> no fire.
+            if (config.GunRequireLoS
+                && IsOccluded(from, eyes, coverMask)
+                && IsOccluded(from, chest, coverMask)
+                && IsOccluded(from, hips, coverMask))
+                return;
 
             // gunshot + muzzle flash (so the player can tell they're being shot at)
             MaybeEffect(config.GunEffect, from);
 
-            Vector3 baseDir = (aim - from) / Mathf.Max(0.001f, dist);
-            Vector3 origin = from + baseDir * 1.2f; // avoid the drone's own collider
-            int obstacleMask = Rust.Layers.Mask.World | Rust.Layers.Mask.Terrain | Rust.Layers.Mask.Construction;
-            float hitChance = Mathf.Clamp01(1f - spreadDeg / 30f);
+            Vector3 baseDir = (chest - from) / Mathf.Max(0.001f, dist);
+            Vector3 origin = from + baseDir * 1.0f; // start just past the drone's own collider
+            float bodyR = Mathf.Max(0.05f, config.GunHitboxRadius);
+            float spread = Mathf.Max(config.GunMinSpread, spreadDeg);
 
             for (int i = 0; i < Mathf.Max(1, pellets); i++)
             {
-                // if blocked by a static obstacle (terrain/building/rock), impact there
-                if (Physics.Raycast(origin, baseDir, out RaycastHit hit, Mathf.Max(0f, dist - 1.4f), obstacleMask))
+                // deviate the shot inside an aim cone; at range the same angle misses by a wider margin
+                Vector3 dir = Quaternion.Euler(
+                    UnityEngine.Random.Range(-spread, spread),
+                    UnityEngine.Random.Range(-spread, spread), 0f) * baseDir;
+
+                // closest approach of this pellet's line to the chest -> did it geometrically hit the body?
+                float t = Vector3.Dot(chest - origin, dir);
+                Vector3 closest = origin + dir * Mathf.Clamp(t, 0f, dist + bodyR);
+                bool wouldHit = t > 0f && Vector3.Distance(closest, chest) <= bodyR;
+
+                if (wouldHit)
                 {
-                    MaybeEffect(config.GunImpactEffect, hit.point);
-                    continue;
-                }
-                if (UnityEngine.Random.value <= hitChance)
-                {
-                    target.Hurt(damage, Rust.DamageType.Bullet, drone, useProtection: config.GunUseProtection);
-                    MaybeEffect(config.GunImpactEffect, aim); // hit: impact on the player
+                    // cover between the drone and the player blocks the hit
+                    if (Physics.Raycast(origin, (chest - origin).normalized, out RaycastHit hit, dist - 0.1f, coverMask))
+                    {
+                        MaybeEffect(config.GunImpactEffect, hit.point);
+                    }
+                    else
+                    {
+                        target.Hurt(damage, Rust.DamageType.Bullet, drone, useProtection: config.GunUseProtection);
+                        MaybeEffect(config.GunImpactEffect, chest);
+                    }
                 }
                 else
                 {
-                    // miss: impact near the player (so they can see bullets flying in)
-                    MaybeEffect(config.GunImpactEffect, aim + UnityEngine.Random.insideUnitSphere * 1.5f);
+                    // stray shot: show it landing wherever the line ends (near the player or on cover)
+                    if (Physics.Raycast(origin, dir, out RaycastHit miss, dist + 2f, coverMask))
+                        MaybeEffect(config.GunImpactEffect, miss.point);
+                    else
+                        MaybeEffect(config.GunImpactEffect, closest);
                 }
             }
+        }
+
+        // True if solid geometry blocks the straight line from a to b.
+        private bool IsOccluded(Vector3 a, Vector3 b, int mask)
+        {
+            Vector3 d = b - a;
+            float len = d.magnitude;
+            if (len < 0.01f) return false;
+            return Physics.Raycast(a, d / len, len - 0.05f, mask);
         }
 
         // Boss: fire a rocket (real explosion) at the player
@@ -1625,12 +1672,48 @@ namespace Oxide.Plugins
                 Effect.server.Run(effect, pos);
         }
 
+        // Scatter loot on the ground when a minigame enemy is killed. Optionally also spawn a container
+        // for an external loot-manager plugin (Loottable) to populate.
+        private void DropLoot(EnemyType type, Vector3 pos)
+        {
+            if (!config.LootEnabled) return;
+
+            // Optional bridge: a loot-manager plugin populates this container if it is configured for the prefab.
+            if (!string.IsNullOrEmpty(config.LootContainerPrefab))
+            {
+                var cont = GameManager.server.CreateEntity(config.LootContainerPrefab, pos + Vector3.up * 0.2f);
+                cont?.Spawn();
+            }
+
+            if (config.LootTables == null) return;
+            if (!config.LootTables.TryGetValue(type.ToString(), out var entries) || entries == null) return;
+            foreach (var e in entries)
+            {
+                if (e == null || string.IsNullOrEmpty(e.Shortname)) continue;
+                if (UnityEngine.Random.value > Mathf.Clamp01(e.Chance)) continue;
+                int amount = UnityEngine.Random.Range(e.Min, Mathf.Max(e.Min, e.Max) + 1);
+                if (amount <= 0) continue;
+                var def = ItemManager.FindItemDefinition(e.Shortname);
+                if (def == null) { PrintWarning($"Loot: unknown item shortname '{e.Shortname}' (check 'Loot - Tables per enemy type')"); continue; }
+                var item = ItemManager.Create(def, amount, e.SkinId);
+                if (item == null) continue;
+                if (!string.IsNullOrEmpty(e.DisplayName)) item.name = e.DisplayName;
+                Vector3 dropPos = pos + UnityEngine.Random.insideUnitSphere * config.LootScatterRadius;
+                dropPos.y = pos.y + 0.3f;
+                item.Drop(dropPos, UnityEngine.Random.insideUnitSphere * 1.2f + Vector3.up * 0.5f);
+            }
+        }
+
         // score handling for downing enemy drones
         private void OnEntityDeath(BaseCombatEntity entity, HitInfo info)
         {
             var agent = entity?.GetComponent<DroneAgent>();
             if (agent == null || agent.Mode != AgentMode.Enemy || _game == null) return;
             var attacker = info?.InitiatorPlayer;
+            // Reward: only for a real player kill during a running game (skips game-stop cleanup and
+            // the charger's self-detonation, which have no player initiator).
+            if (_game.Running && attacker != null)
+                DropLoot(agent.Enemy, entity.transform.position);
             _game.OnBomberDestroyed(agent, attacker);
         }
 
@@ -1865,15 +1948,30 @@ namespace Oxide.Plugins
         }
         private readonly Dictionary<ulong, PatternEdit> _editors = new Dictionary<ulong, PatternEdit>();
 
-        private void LoadPatternData()
+        // Read data/DroneShow_Patterns.json from disk. Returns the loaded count, or -1 on parse error.
+        // On error we KEEP the current in-memory patterns (never wipe good data because of a bad hand-edit).
+        private int LoadPatternData()
         {
-            PatternData loaded = null;
-            try { loaded = Interface.Oxide.DataFileSystem.ReadObject<PatternData>("DroneShow_Patterns"); }
-            catch { loaded = null; }
-            _patternData = new PatternData(); // rebuild the case-insensitive dictionary
+            PatternData loaded;
+            try
+            {
+                loaded = Interface.Oxide.DataFileSystem.ReadObject<PatternData>("DroneShow_Patterns");
+            }
+            catch (Exception ex)
+            {
+                // Surface the parse error instead of silently swallowing it. A malformed manual edit
+                // (stray comma, full-width quotes, etc.) lands here; keep existing patterns intact.
+                PrintWarning($"Failed to read data/DroneShow_Patterns.json - keeping current patterns. Error: {ex.Message}");
+                if (_patternData == null) _patternData = new PatternData();
+                return -1;
+            }
+            // Rebuild the case-insensitive dictionary from the deserialized (ordinal) one.
+            var fresh = new PatternData();
             if (loaded?.Patterns != null)
                 foreach (var kv in loaded.Patterns)
-                    if (kv.Value != null) _patternData.Patterns[kv.Key] = kv.Value;
+                    if (kv.Value != null) fresh.Patterns[kv.Key] = kv.Value;
+            _patternData = fresh;
+            return _patternData.Patterns.Count;
         }
         private void SavePatternData() => Interface.Oxide.DataFileSystem.WriteObject("DroneShow_Patterns", _patternData);
 
@@ -1952,6 +2050,12 @@ namespace Oxide.Plugins
                     if (args.Length < 2) { Msg(player, "Usage_PatternDelete"); return; }
                     if (_patternData.Patterns.Remove(args[1])) { SavePatternData(); Msg(player, "Pattern_Deleted", args[1]); }
                     else Msg(player, "Pattern_DeleteNotFound");
+                    break;
+                case "reload":
+                    // Re-read data/DroneShow_Patterns.json from disk so manual edits apply without a full plugin reload.
+                    int n = LoadPatternData();
+                    if (n < 0) Msg(player, "Pattern_ReloadError");
+                    else Msg(player, "Pattern_Reloaded", n);
                     break;
                 default:
                     Msg(player, "Help_Pattern");
@@ -2188,6 +2292,17 @@ namespace Oxide.Plugins
         // =====================================================================
         private Configuration config;
 
+        // One loot line for the per-enemy-type drop table.
+        public class LootEntry
+        {
+            [JsonProperty("Item shortname")] public string Shortname = "scrap";
+            [JsonProperty("Min amount")] public int Min = 1;
+            [JsonProperty("Max amount")] public int Max = 1;
+            [JsonProperty("Chance (0-1)")] public float Chance = 1f;
+            [JsonProperty("Skin ID")] public ulong SkinId = 0;
+            [JsonProperty("Custom name (optional, empty = default)")] public string DisplayName = "";
+        }
+
         public class Configuration
         {
             [JsonProperty("Drone prefab path")]
@@ -2266,7 +2381,9 @@ namespace Oxide.Plugins
             public float BombDropSpeed = 6f;
             [JsonProperty("Bomber - Fuse (sec)")]
             public float BombFuse = 2.5f;
-            [JsonProperty("Bomber - Bomb prefabs")]
+            // ObjectCreationHandling.Replace: without it, Json.NET APPENDS the JSON entries to this
+            // pre-populated list on every load, so the config grows on each reload.
+            [JsonProperty("Bomber - Bomb prefabs", ObjectCreationHandling = ObjectCreationHandling.Replace)]
             public List<string> BombPrefabs = new List<string>
             {
                 "assets/prefabs/weapons/f1 grenade/grenade.f1.deployed.prefab",
@@ -2288,6 +2405,13 @@ namespace Oxide.Plugins
             public string GunEffect = "assets/prefabs/weapons/ak47u/effects/attack.prefab";
             [JsonProperty("Gun - Impact effect (empty to disable)")]
             public string GunImpactEffect = "";
+            // ---- Gun accuracy / dodge (like an NPC: cover blocks, distance/spread let you dodge) ----
+            [JsonProperty("Gun - Require line of sight to fire (won't shoot through roofs/walls)")]
+            public bool GunRequireLoS = true;
+            [JsonProperty("Gun - Min spread (deg, higher = easier to dodge, prevents pin-point aim)")]
+            public float GunMinSpread = 1.5f;
+            [JsonProperty("Gun - Target hitbox radius (m, smaller = easier to dodge)")]
+            public float GunHitboxRadius = 0.45f;
 
             // ---- Gunner: rapid ----
             [JsonProperty("Gunner Rapid - Health")]
@@ -2361,6 +2485,38 @@ namespace Oxide.Plugins
             public string BossSmokeEffect = "";
             [JsonProperty("Boss - Smoke puff interval (sec)")]
             public float BossSmokeInterval = 0.35f;
+
+            // ---- Loot (scattered when a minigame enemy is killed by a player) ----
+            [JsonProperty("Loot - Enable drops")]
+            public bool LootEnabled = true;
+            [JsonProperty("Loot - Scatter radius (m)")]
+            public float LootScatterRadius = 1.5f;
+            // Optional bridge to a loot-manager plugin (e.g. Loottable): if set, ALSO spawn this container
+            // prefab at the death spot, which that plugin (if configured for the prefab) will populate.
+            // Leave empty to use only the scatter table below.
+            [JsonProperty("Loot - Also spawn container prefab for a loot plugin (empty = disable)")]
+            public string LootContainerPrefab = "";
+            // Scatter table per enemy type. Keys: Charger / Bomber / GunnerRapid / GunnerSniper / GunnerShotgun / Boss.
+            // Replace: without it Json.NET would append the JSON entries to these defaults on every reload.
+            [JsonProperty("Loot - Tables per enemy type", ObjectCreationHandling = ObjectCreationHandling.Replace)]
+            public Dictionary<string, List<LootEntry>> LootTables = new Dictionary<string, List<LootEntry>>
+            {
+                ["Charger"] = new List<LootEntry> { new LootEntry { Shortname = "scrap", Min = 5, Max = 15 } },
+                ["Bomber"] = new List<LootEntry>
+                {
+                    new LootEntry { Shortname = "scrap", Min = 10, Max = 20 },
+                    new LootEntry { Shortname = "gunpowder", Min = 5, Max = 15, Chance = 0.5f },
+                },
+                ["GunnerRapid"] = new List<LootEntry> { new LootEntry { Shortname = "scrap", Min = 10, Max = 20 } },
+                ["GunnerSniper"] = new List<LootEntry> { new LootEntry { Shortname = "scrap", Min = 15, Max = 30 } },
+                ["GunnerShotgun"] = new List<LootEntry> { new LootEntry { Shortname = "scrap", Min = 10, Max = 25 } },
+                ["Boss"] = new List<LootEntry>
+                {
+                    new LootEntry { Shortname = "scrap", Min = 100, Max = 300 },
+                    new LootEntry { Shortname = "metal.refined", Min = 20, Max = 50 },
+                    new LootEntry { Shortname = "rifle.ak", Min = 1, Max = 1, Chance = 0.5f },
+                },
+            };
 
             // return the durability (HP) per type
             public float HealthFor(EnemyType type)
