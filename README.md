@@ -125,6 +125,7 @@ Permission: `droneshow.use`
 | `/dronepattern link <group>` | **Live-preview** the artwork being edited on real drones |
 | `/dronepattern list` | List saved patterns |
 | `/dronepattern delete <name>` | Delete |
+| `/dronepattern reload` | Reload patterns from the data file (apply manual edits without a full plugin reload) |
 
 **Using the UI:**
 - Pick a **Mode** / **Brush** button at the bottom, then click grid cells to draw.
@@ -148,8 +149,11 @@ Permission: `droneshow.use`
 
 ### About large patterns (e.g. 100×100)
 - The **UI editor (click-based) limit** is `Pattern editor max grid size` (default 32, max 64). This is due to the number of CUI buttons; beyond it gets heavy/unstable. Click-editing 100×100 is impractical.
-- For **larger / more precise artwork**, edit the data file `data/DroneShow_Patterns.json` **directly** for **unlimited size** (just list rows of `#`/`.`; you can also convert from an image and paste).
-- However, **only up to `Max drones per group` lit dots (default 256)** can be displayed (1 lit dot = 1 drone). Even a 100×100 "sparse" image with few dots can be shown, but a large densely-lit image hits the drone-count / server-load limit.
+- For **larger / more precise artwork**, edit the data file **directly** for **unlimited size** (just list rows of `#`/`.`; you can also convert from an image and paste).
+  - **Exact path**: `oxide/data/DroneShow_Patterns.json` (Carbon: `carbon/data/DroneShow_Patterns.json`).
+  - **After editing, load it** with `/dronepattern reload` (or reload the plugin). Edits are **not** picked up automatically while the server runs.
+  - **Keep the JSON valid**: use a plain-text editor with **straight ASCII quotes** (`"`), no smart/full-width quotes, and each pattern is an **array of equal-ish-length string rows**. If the file is malformed, the plugin logs a warning to the server console and **keeps your existing patterns** (it no longer wipes them silently). `/dronepattern reload` reports how many were loaded, so you can tell whether an edit parsed.
+- However, **only up to `Max drones per group` lit dots (default 2500)** can be displayed (1 lit dot = 1 drone). Even a 100×100 "sparse" image with few dots can be shown, but a large densely-lit image hits the drone-count / server-load limit.
 
 ---
 
@@ -165,6 +169,8 @@ Permission: `droneshow.admin`
 
 Enemy drones attack while **orbiting the player as a formation**. The count grows as waves progress, and the boss appears on the final wave. Kills add to your score, and clearing all enemies wins.
 
+> ⚠️ **Who gets attacked**: each drone targets the **nearest connected player within the arena** (center ± `Arena radius × 1.5`, i.e. ~60m by default) — **not only the player who started the game**. There is currently **no team / permission / admin filter**, so any bystander inside the arena can be attacked. Players who are outside the radius, dead, or sleeping are ignored.
+
 **Enemy types:**
 | Type | Behavior |
 |---|---|
@@ -175,8 +181,15 @@ Enemy drones attack while **orbiting the player as a formation**. The count grow
 | Shotgun gunner | Fires a spread of pellets at close range |
 | Boss (final wave) | Large and durable. Mostly uses **guns** with occasional rockets. When low on health it **enrages**, billows black smoke, and fires rockets rapidly |
 
-- Gunfire is hitscan (instant hit). The gunshot + muzzle flash + impact effect make it clear you're being shot at.
+- Gunfire behaves like a normal NPC's: gunners only shoot when they can **see** you (roofs, walls, and containers block them), and each shot is fired down an **aim cone**, so you can **dodge by moving, using cover, or keeping distance**. Tune it with the `Gun - ...` config keys.
 - The boss is scaled up via `networkEntityScale`, which syncs the scale to clients (no external plugin needed).
+
+### Loot drops
+When a **player kills** a minigame enemy (or the boss), it **scatters items on the ground** at the death spot. Loot is fully configurable **per enemy type**.
+
+- Edit `Loot - Tables per enemy type` in the config. Keys: `Charger` / `Bomber` / `GunnerRapid` / `GunnerSniper` / `GunnerShotgun` / `Boss`. Each entry has `Item shortname`, `Min amount`, `Max amount`, `Chance (0-1)`, `Skin ID`, and an optional `Custom name`.
+- Drops only trigger on a **real player kill during a running game** — the charger's self-detonation and game-stop cleanup drop nothing.
+- **Optional loot-plugin bridge**: set `Loot - Also spawn container prefab for a loot plugin` to a container prefab. On death, DroneShow **also** spawns that container, which a loot manager such as **Loottable** can populate — **if** you have configured that plugin for the prefab. (There is no direct API call into Loottable; it works by spawning a container the loot plugin recognizes.) Leave it empty to use only the built-in scatter table.
 
 ---
 
@@ -188,7 +201,7 @@ All config keys are in English. Main ones:
 | Key | Default | Description |
 |---|---|---|
 | `Drone prefab path` | `drone.deployed.prefab` | The drone prefab |
-| `Max drones per group` | 256 | Max drones per group (longer text needs more) |
+| `Max drones per group` | 2500 | Max drones per group (longer text needs more) |
 | `Default spawn height (m)` | 35 | Default spawn height (also applied to auto-creation) |
 | `Default formation spacing (m)` | 2.5 | Formation spacing |
 | `Text - Dot spacing (m)` | 1.8 | Dot spacing for text/patterns |
@@ -207,11 +220,25 @@ All config keys are in English. Main ones:
 | `Spawn count - <Type> base` / `... per wave` | — | Per-type initial count / per-wave growth |
 | `Charger - Health` / `Bomber - Health`, etc. | 30 / 60 | **Per-type HP** |
 | `Gunner Rapid/Sniper/Shotgun - Health/Damage/...` | — | Per-gunner attacks |
+| `Gun - Require line of sight to fire` | true | Gunners won't shoot through roofs/walls (need to see you) |
+| `Gun - Min spread (deg)` | 1.5 | Minimum aim cone — higher = easier to dodge, no pin-point aim |
+| `Gun - Target hitbox radius (m)` | 0.45 | Player hit size — smaller = easier to dodge |
 | `Boss - Health` / `Boss - Size multiplier` | 1500 / 3 | Boss durability / size |
 | `Boss Rocket - Interval normal/enraged` | 10 / 3 | Rocket interval (normal/enraged) |
 | `Boss - Enrage smoke effect / Smoke interval` | rocket_smoke / 0.6 | Black smoke while enraged |
+| `Loot - Enable drops` | true | Enemies scatter loot when killed by a player |
+| `Loot - Scatter radius (m)` | 1.5 | How far dropped items spread from the death spot |
+| `Loot - Tables per enemy type` | (per-type) | Item drop table per enemy type / boss (shortname, min/max, chance, skin, name) |
+| `Loot - Also spawn container prefab for a loot plugin` | "" | Optional: also spawn this container for Loottable etc. to fill (empty = off) |
 
-> **Important**: Even if you change config keys or defaults, **values in an existing `DroneShow.json` are kept**. To apply new defaults (e.g. `Max drones per group=256`, `Default spawn height=35`), edit those values manually or delete the config to regenerate it.
+> **Important — how config values are applied (edit the JSON, not the `.cs`)**
+>
+> On load the plugin reads `DroneShow.json` and **keeps the values already in it**; new keys are added with their defaults, but existing values are never overwritten. So:
+> - **To change a setting**, edit the value in the **config file** and reload the plugin:
+>   - File: `oxide/config/DroneShow.json` (Carbon: `carbon/config/DroneShow.json`)
+>   - Then run `o.reload DroneShow` (Carbon: `c.reload DroneShow`).
+> - **Editing the plugin `.cs` default does nothing to an existing server** — code defaults only apply when the JSON is generated fresh.
+> - **To adopt all new defaults at once**, delete `DroneShow.json` and reload; it regenerates from the code defaults (you lose any custom values).
 
 ---
 
@@ -235,7 +262,7 @@ This plugin uses the uMod [Localization API](https://umod.org/documentation/api/
 - **Collision avoidance**: `body.detectCollisions=false` keeps drones from knocking into each other / terrain and crashing (bullets are raycasts, so they can still down them).
 - **Text layout**: A 5×7 dot font or any array is expanded into center-relative points and assigned to each drone. Orientation is applied on the display side via **Pitch (tilted in WorldSlot)**. Surplus drones are Parked underground and turned off.
 - **Boss scaling**: `transform.localScale` + **`networkEntityScale=true`** syncs the scale to clients (set before `Spawn()`). No external plugin needed.
-- **Gunfire**: Hitscan + muzzle/impact effects. Occlusion checks consider terrain and buildings only.
+- **Gunfire**: NPC-style hitscan. A gunner only fires when a body point is visible (line-of-sight gate); each pellet is deviated inside an aim cone and occluded by world/terrain/construction/deployed geometry, and only damages the player if its line passes through the body capsule with a clear path. Cover blocks it, and distance/spread make it dodgeable.
 - **Anti-hijack**: The `OnEntityControl` hook makes this plugin's drones impossible to pilot.
 
 ---
